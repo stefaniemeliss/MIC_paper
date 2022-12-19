@@ -1,0 +1,1552 @@
+---
+title: "Analysis resting state data"
+author: "Stef Meliss"
+date: "`r format(Sys.time(), '%B %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+rm(list = ls())
+
+download_data <- FALSE
+
+# helper functions and packages #
+
+library(lme4)
+library(psych)
+library(ggplot2)
+library(dplyr)
+library(reshape2)
+library(kableExtra)
+library("wesanderson")
+library(plotly)
+library(GGally)
+library(cowplot)
+
+source("https://raw.githubusercontent.com/datavizpyr/data/master/half_flat_violinplot.R")
+
+# define version 
+version <- "MAGMOT"
+version_official <- "fmri"
+dataset_name <- "MMC"
+
+filename_tables <- "tables_rest_paper.xlsx"
+
+# delete output files
+ifelse(file.exists(filename_tables), file.remove(filename_tables), FALSE)
+
+# define memory levels and corresponding labels
+memoryLevels <- c("recognitionConfLevel_4_5_6")
+memoryLabels <- c("highConf")
+
+DV_wide <- c(paste0(memoryLabels, "_abs")) # total sum scores
+#DV_wide <- c(DV_wide, "memory_corrected", paste0("curBetaFull_",memoryLabels)) # betas
+DV_wide <- c(DV_wide, paste0("curBetaFull_",memoryLabels)) # betas
+DV_wide <- c("highConf_abs", "CDMB", "memory_corrected", "cor_cur_mem_z")
+
+effects <- c("Total # items encoded", "Curiosity-driven memory benefit", "Corrected memory", "Within-person correlation")
+
+
+# define scan, phase, and smooth variable
+scan <- c("pre", "post", "online", "offline")
+phase <- c("diff", "online", "offline")
+phase_new <- c("Change [pre < post]", "Online encoding", "Offline encoding")
+
+smooth <- c("s0", "s4", "s6", "s8")
+
+# make sub folder
+anal_dir <- getwd()
+data_dir <- file.path(anal_dir, "data")
+setwd(data_dir)
+
+### process behavioural data and compute memory scores ###
+
+# behavioural data
+dfWide <- read.csv(paste0(dataset_name, "_demographics.csv"), stringsAsFactors = F)
+dfLong <- read.csv(paste0(dataset_name, "_experimental_data.csv"), stringsAsFactors = F)
+
+# effect-code group
+dfLong$group_ec <- ifelse(dfLong$group == "exp", 1, -1) # effect code group
+
+# compute subject score for recognition regardless of confidence
+temp <- aggregate(dfLong$recognition, by=list(BIDS=dfLong$BIDS), FUN=sum, na.rm = T)
+names(temp) <- c("BIDS", "allConf_abs")
+dfWide <- merge(dfWide, temp, by = "BIDS")
+
+# create new correct memory measurement to follow Duncan 2014 and Tompary 2015 #
+# score each item that received a high confidence ratimng depending on whether that was correct or not
+dfLong$HC_correct <- ifelse(dfLong$recognition == 1 & dfLong$responseConfidence > 3, 1, 0)
+dfLong$HC_incorrect <- ifelse(dfLong$recognition == 0 & dfLong$responseConfidence > 3, 1, 0)
+
+# compute subject sumscore high confidence correct
+temp <- aggregate(dfLong$HC_correct, by=list(BIDS=dfLong$BIDS), FUN=sum, na.rm = T)
+names(temp) <- c("BIDS", "HC_correct")
+dfWide <- merge(dfWide, temp, by = "BIDS")
+# compute subject sumscore high confidence incorrect correct
+temp <- aggregate(dfLong$HC_incorrect, by=list(BIDS=dfLong$BIDS), FUN=sum, na.rm = T)
+names(temp) <- c("BIDS", "HC_incorrect")
+dfWide <- merge(dfWide, temp, by = "BIDS")
+
+# use scores computed above to correct memory score
+# note: both ways to calculate the corrected memory performance are linear transformations of one another and thereby perfectly correlated
+dfWide$memory_corrected <- (dfWide$HC_correct - dfWide$HC_incorrect / 4) / length(unique(dfLong$stimID)) # Tompary et al 2015 --> creates a percentage (similar to a hit rate)
+dfWide$memory_corrected <- dfWide$HC_correct - dfWide$HC_incorrect / 4  # Duncan et al 2014
+
+# remove all ppt with less than 25% chance level performance --> no one removed
+dfWide <- subset(dfWide, dfWide$allConf_abs > (length(unique(dfLong$stimID))/4))
+
+#  make sure that BIDS and stimID are factors    
+dfLong$BIDS <- as.factor(as.character(dfLong$BIDS)) 
+dfLong$stimID <- as.factor(as.character(dfLong$stimID))
+
+# compute variables within subjects #
+subjects <- dfWide$BIDS
+dfLong$cur_cwc <- NA
+dfWide$cor_cur_mem <- NA
+for (s in seq_along(subjects)) {
+  # center curiosity:  within cluster (CWC, i.e., group-mean centering or Center Within Cluster)
+  dfLong[dfLong$BIDS == subjects[s], "cur_cwc"] <- dfLong[dfLong$BIDS == subjects[s], "responseCuriosity"] - mean(dfLong[dfLong$BIDS == subjects[s], "responseCuriosity"], na.rm = T)
+  # comopute within-person correlation between centered curiosity values and encoding performance (dummy-coded)
+  dfWide[dfWide$BIDS == subjects[s], "cor_cur_mem"] <- cor(dfLong[dfLong$BIDS == subjects[s], "cur_cwc"], dfLong[dfLong$BIDS == subjects[s], "recognitionConfLevel_4_5_6"])
+}
+dfWide$cor_cur_mem_z <- atanh(dfWide$cor_cur_mem)
+
+# compute indices necessary to compute CDMB #
+# multiply mean-centered curiosity and memory performance: creates variable that is 0 if item was forgotten and cur_cwc if item was remembered
+dfLong$cur_x_highConf <- dfLong$cur_cwc * dfLong$recognitionConfLevel_4_5_6 # product of curiosity and memory
+
+# create values for product of curiosity and memory above and below zero
+dfLong$cur_x_highConf_above_0 <- ifelse(dfLong$cur_x_highConf > 0, dfLong$cur_x_highConf, 0) # only contains positive values: item remembered with cur_cwc above 0
+dfLong$cur_x_highConf_below_0 <- ifelse(dfLong$cur_x_highConf < 0, dfLong$cur_x_highConf, 0) # only contains negative values: item remembered with cur_cwc below 0
+
+# create curiosity values above and below zero
+dfLong$cur_cwc_above_0 <- ifelse(dfLong$cur_cwc > 0, dfLong$cur_cwc, 0) # only contains positive values: items with cur_cwc above 0
+dfLong$cur_cwc_below_0 <- ifelse(dfLong$cur_cwc < 0, dfLong$cur_cwc, 0) # only contains negative values: items with cur_cwc below 0
+
+
+for (mem in 1:length(memoryLevels)) {
+  
+  # total # of items encoded #
+  # sum up subject score for all memory levels and add to dfWide
+  temp <- aggregate(dfLong[[paste0(memoryLevels[mem])]], by=list(BIDS=dfLong$BIDS), FUN=sum, na.rm = T)
+  names(temp) <- c("BIDS", paste0(memoryLabels[mem], "_abs"))
+  dfWide <- merge(dfWide, temp, by = "BIDS")
+  rm(temp)
+  
+  
+  # curiosity-driven memory benefit (CDMB) #
+  # sum of product of mean-centered curiosity ratings above zero and dummy-coded memory encoding (at a given threshold) divided by sum of mean-centered curiosity ratings above zero - sum of product of mean-centered curiosity ratings below zero and dummy-coded memory encoding (at a given threshold) divided by sum of mean-centered curiosity ratings below zero
+  
+  # 1. compute CDMB using curiosity as a continouos variable 
+  
+  temp1 <- aggregate(dfLong[, paste0("cur_x_", memoryLabels[mem], "_above_0")], by=list(BIDS=dfLong$BIDS), FUN=sum, na.rm = T) # compute sum of product of mean-centered curiosity ratings above zero and dummy-coded memory encoding 
+  
+  temp2 <- aggregate(dfLong[, paste0("cur_cwc_above_0")], by=list(BIDS=dfLong$BIDS), FUN=sum, na.rm = T) # compute sum of mean-centered curiosity ratings above zero 
+  
+  temp3 <- aggregate(dfLong[, paste0("cur_x_", memoryLabels[mem], "_below_0")], by=list(BIDS=dfLong$BIDS), FUN=sum, na.rm = T) # compute sum of product of mean-centered curiosity ratings below zero and dummy-coded memory encoding 
+  
+  temp4 <- aggregate(dfLong[, paste0("cur_cwc_below_0")], by=list(BIDS=dfLong$BIDS), FUN=sum, na.rm = T) # compute sum of mean-centered curiosity ratings below zero 
+  
+  
+  # combine all
+  temp <- merge(temp1, temp2, by = "BIDS")
+  temp <- merge(temp, temp3, by = "BIDS")
+  temp <- merge(temp, temp4, by = "BIDS")
+  # rename columns
+  names(temp) <- c("BIDS", "sum_cur_x_highConf_above_0", "sum_cur_above_0", "sum_cur_x_highConf_below_0", "sum_cur_below_0")
+  # compute CDMB using curiosity as a continuous variable
+  temp$CDMB_cont <- (temp$sum_cur_x_highConf_above_0 / temp$sum_cur_above_0) - (temp$sum_cur_x_highConf_below_0 / temp$sum_cur_below_0)
+  # combine with dfWide
+  try <- temp[, c("BIDS", "CDMB_cont")]
+  dfWide <- merge(dfWide, try, by = "BIDS") # merge with dfWide
+  # delete variables
+  rm(temp, temp1, temp2, temp3, temp4, try)
+  
+  # 2. compute CDMB using curiosity as a dichotomous variable 
+  
+  temp1 <- aggregate(dfLong[, paste0("cur_x_", memoryLabels[mem])] > 0, by=list(BIDS=dfLong$BIDS), FUN=sum, na.rm = T) # compute sum of product of mean-centered curiosity ratings above zero and dummy-coded memory encoding 
+  
+  temp2 <- aggregate(dfLong[, "cur_cwc"] > 0, by=list(BIDS=dfLong$BIDS), FUN=sum, na.rm = T) # compute sum of mean-centered curiosity ratings above zero 
+  
+  temp3 <- aggregate(dfLong[, paste0("cur_x_", memoryLabels[mem])] < 0, by=list(BIDS=dfLong$BIDS), FUN=sum, na.rm = T) # compute sum of product of mean-centered curiosity ratings below zero and dummy-coded memory encoding 
+  
+  temp4 <- aggregate(dfLong[, "cur_cwc"] < 0, by=list(BIDS=dfLong$BIDS), FUN=sum, na.rm = T) # compute sum of mean-centered curiosity ratings below zero 
+  
+  # combine all
+  temp <- merge(temp1, temp2, by = "BIDS")
+  temp <- merge(temp, temp3, by = "BIDS")
+  temp <- merge(temp, temp4, by = "BIDS")
+  # rename columns
+  names(temp) <- c("BIDS", "sum_cur_x_highConf_above_0", "sum_cur_above_0", "sum_cur_x_highConf_below_0", "sum_cur_below_0")
+  # compute CDMB using curiosity as a dichotomous variable
+  temp$CDMB <- (temp$sum_cur_x_highConf_above_0 / temp$sum_cur_above_0) - (temp$sum_cur_x_highConf_below_0 / temp$sum_cur_below_0)
+  # combine with dfWide
+  try <- temp[, c("BIDS", "CDMB")]
+  dfWide <- merge(dfWide, try, by = "BIDS") # merge with dfWide
+  # delete variables
+  rm(temp, temp1, temp2, temp3, temp4, try2)
+}
+
+
+# save the behavioural covariates in a txt file to use for ANCOVA in AFNI #
+# extract relevant columns
+df_cov <- dfWide[, c("BIDS", "highConf_abs", "CDMB")]
+covs <- names(df_cov)
+covs <- covs[covs != "BIDS"]
+# shorten subject id
+df_cov$BIDS <- gsub("control0", "c", df_cov$BIDS)
+df_cov$BIDS <- gsub("experimental0", "e", df_cov$BIDS)
+
+
+seeds <- c("aHPC", "VTASN")
+for (seed in seeds) {
+  
+  # add seed string
+  temp <- df_cov # copy data
+  temp$BIDS <- gsub("sub-", paste0(seed, "_diff_"), df_cov$BIDS) # replace sub with [seed]_diff_
+  temp$BIDS <- paste0(temp$BIDS, "_zcorr") # add zcorr at the end
+  
+  for (cov in covs) {
+     # save data
+  write.table(temp[,c("BIDS", cov)], paste0(cov, "_", seed, ".txt"), quote = F, row.names = F)
+  #assign(paste0("cov_", seed), temp)
+  #rm(temp)
+    
+  }
+  
+ 
+}
+
+
+# create dfLong_behav #
+
+#dfLong_behav <- dfWide[, c("ID", "group", "highConf_abs", "curBetaFull_highConf", "curBetaRed_highConf")]
+# select relevant columns
+dfLong_behav <- dfWide[, c("ID", "group", DV_wide)] # select rele
+# change from wide to long format
+dfLong_behav <- reshape2::melt(dfLong_behav, id=c("ID", "group"))
+# change variable names
+dfLong_behav$var <-dfLong_behav$variable
+dfLong_behav$variable <- NA
+for (i in 1:length(unique(dfLong_behav$var))) {
+  dfLong_behav$variable[dfLong_behav$var == DV_wide[i]] <- paste0(effects[i])
+}
+dfLong_behav$group <- ifelse(dfLong_behav$group == "cont", "Control", "Incentives")
+
+
+### process gcor files ###
+
+# load in gcor files
+gcor_files <- list.files(pattern = "gcor")
+gcor_files <- gcor_files[grepl(".txt", gcor_files)] # only use .txt files
+
+i <- 0
+for (file in gcor_files) {
+  
+  i <- i+1
+  # read in file
+  temp <- read.delim(file)
+  # add new column names
+  names(temp) <- c("BIDS", paste0(gsub(".txt", "", file)))
+  
+  # merge together
+  if (i == 1) {
+    gcor <- temp
+  } else {
+    gcor <- merge(gcor, temp, by = "BIDS")
+  }  
+  
+  rm(temp)
+  
+}
+
+dfWide <- merge(dfWide, gcor, by = "BIDS")
+rm(gcor, gcor_files)
+
+# create gcor data in long format #
+
+for (s in seq_along(smooth)) { # for each smoothing kernel
+  
+  # select the corresponding gcor data for the kernel
+  temp <- melt(dfWide, id=c("ID", "group"), measure = c(names(dfWide)[grepl(smooth[s], names(dfWide)) & grepl("gcor", names(dfWide))]))
+  
+  # combine data for different kernels
+  if (s == 1) {
+    dfLong_gcor <- temp
+  } else {
+    dfLong_gcor <- rbind(dfLong_gcor, temp)
+  }
+  
+  # remove temp object
+  rm(temp)
+  
+}
+
+# rename columns
+names(dfLong_gcor) <- c("ID", "group", "run", "gcor")
+
+# change group labels
+dfLong_gcor$group <- ifelse(dfLong_gcor$group == "cont", "Control", "Incentives")
+
+# add scan columm
+dfLong_gcor$scan <- ifelse(grepl("pre", dfLong_gcor$run), "pre",
+                           ifelse(grepl("post", dfLong_gcor$run), "post",
+                                  ifelse(grepl("online", dfLong_gcor$run), "online",
+                                         ifelse(grepl("offline", dfLong_gcor$run), "offline", NA))))
+# add smooth column
+dfLong_gcor$smooth <- ifelse(grepl("s0", dfLong_gcor$run), "s0",
+                             ifelse(grepl("s4", dfLong_gcor$run), "s4",
+                                    ifelse(grepl("s6", dfLong_gcor$run), "s6",
+                                           ifelse(grepl("s8", dfLong_gcor$run), "s8", NA))))
+
+
+### ROI-to-ROI correlation values ###
+
+# load in gcor files
+maskave_files <- list.files(pattern = "maskave")
+
+i <- 0
+for (file in maskave_files) {
+  
+  i <- i+1
+  # read in file
+  temp <- read.delim(file, header = FALSE)
+  # add new column names
+  names(temp) <- paste0(gsub("maskave", "aHPC", file))
+  
+  # add name column
+  temp$BIDS <- NA
+  temp$BIDS[1:6] <- c("mean", "mean_Zscr", "gcor", "gcor_Zscr", "mean_NC", "mean_NC_Zscr")
+  temp$BIDS[7:56] <- dfWide$BIDS
+  
+  # merge together
+  if (i == 1) {
+    maskave <- temp
+  } else {
+    maskave <- merge(maskave, temp, by="BIDS")
+  }  
+  
+  rm(temp)
+  
+}
+
+# merge data expect the first 6 rows (represent mean value across sample, covariate, mean without covariate, all including z values)
+dfWide <- merge(dfWide, maskave[7:56, ], by = "BIDS")
+rm(maskave)
+
+# change col names (note: values were already Fisher's z transformed within AFNI)
+# names are now: FC_[scan]_[smooth]
+names(dfWide) <- gsub("aHPC_VTASN", "FC", names(dfWide))
+
+
+# compute RSFC change #
+for (s in seq_along(smooth)) { # for each smoothing kernel
+  
+  # diff = post - pre
+  dfWide[, paste0("FC_diff_", smooth[s])] <- dfWide[, paste0("FC_post_", smooth[s])] - dfWide[, paste0("FC_pre_", smooth[s])]
+  
+  
+  # subtract pre learning rest value from online and offline encoding
+  # dfWide[, paste0("FC_online_", smooth[s])] <- dfWide[, paste0("FC_online_", smooth[s])] - dfWide[, paste0("FC_pre_", smooth[s])]
+  # dfWide[, paste0("FC_offline_", smooth[s])] <- dfWide[, paste0("FC_offline_", smooth[s])] - dfWide[, paste0("FC_pre_", smooth[s])]
+  
+}
+
+
+
+# create FC data in long format #
+
+for (p in seq_along(phase)) { # for each phase
+  
+  # select the corresponding gcor data for the kernel
+  temp <- melt(dfWide, id=c("ID", "group"), measure = c(names(dfWide)[grepl(phase[p], names(dfWide)) & grepl("FC", names(dfWide))]))
+  
+  # combine data for different kernels
+  if (p == 1) {
+    dfLong_fc <- temp
+  } else {
+    dfLong_fc <- rbind(dfLong_fc, temp)
+  }
+  
+  # remove temp object
+  rm(temp)
+  
+}
+
+# rename columns
+names(dfLong_fc) <- c("ID", "group", "run", "fc")
+
+# change group labels
+dfLong_fc$group <- ifelse(dfLong_fc$group == "cont", "Control", "Incentives")
+
+# add phase columm
+dfLong_fc$phase <- ifelse(grepl("diff", dfLong_fc$run), "diff",
+                          ifelse(grepl("online", dfLong_fc$run), "online",
+                                 ifelse(grepl("offline", dfLong_fc$run), "offline", NA)))
+# add smooth column
+dfLong_fc$smooth <- ifelse(grepl("s0", dfLong_fc$run), "s0",
+                           ifelse(grepl("s4", dfLong_fc$run), "s4",
+                                  ifelse(grepl("s6", dfLong_fc$run), "s6",
+                                         ifelse(grepl("s8", dfLong_fc$run), "s8", NA))))
+
+
+# go back into analysis dir
+setwd(anal_dir)
+
+# define general variables for plots
+title_font_size=14
+axis_title_font_size=11
+axis_text_font_size=8
+
+```
+
+
+This markdown represents a summary of the functional connectivity (FC) results, i.e. how changes in *resting state* functional connectivity (RSFC) relate to memory performance. This captures *post-encoding/consolition processes*. Addionally, the concatenated time course of the *task data* was used to investigate functional connectivity during *online and offline encoding* and how this relates to memory performance.
+
+## Behavioural scores
+
+### Measures of Learning
+
+#### Total # items encoded
+
+To calculate the total # of items encoded, for each subject, a sum score was created adding up all items remembered  
+
+(a) regardless of threshold to test whether cognition performance was above chance level  
+```{r}
+# one sample t-test to see whether recognition performance was above chance
+describe(dfWide$allConf_abs)
+t.test(dfWide$allConf_abs, mu = (length(unique(dfLong$stimID))/4), alternative = "greater")
+effsize::cohen.d(dfWide$allConf_abs, f = NA, mu = (length(unique(dfLong$stimID))/4))
+```
+
+(b) at the high confidence threshold to calculate descriptive statistics and test for effects of group.
+```{r}
+# two sample t-test to see whether high confidence recognition differed between both groups
+describe(dfWide$highConf_abs)
+describe.by(dfWide$highConf_abs, dfWide$group)
+t.test(dfWide$highConf_abs ~ dfWide$group)
+effsize::cohen.d(dfWide$allConf_abs, f = dfWide$group)
+```
+
+#### Corrected memory score
+
+To follow suggestions by others investigating post-encoding rest (e.g., Duncan et al., 2014, Tompary et al., 2015), a corrected high confidence memory score was calculated to account for correct guesses using the formula below:  
+Corrected memory score = sum(high condidence correct) - sum ((high confidence incorrect) / number of alternatives)
+
+```{r}
+# two sample t-test to see whether corrected high confidence recognition differed between both groups
+describe(dfWide$memory_corrected)
+describe.by(dfWide$memory_corrected, dfWide$group)
+t.test(dfWide$memory_corrected ~ dfWide$group)
+effsize::cohen.d(dfWide$memory_corrected, f = dfWide$group)
+```
+
+
+### Measures of the Effects of Curiosity on Learning
+
+#### Within-person correlation between curiosity and encoding
+
+For each subject, the correlation between mean-centred curiosity ratings and high confidence recogntion is computed and correlation coefficients are Fisher's z-transformed.
+
+```{r}
+# two sample t-test to see whether within-person correlation (z transformed) differed between both groups
+describe(dfWide$cor_cur_mem_z)
+describe.by(dfWide$cor_cur_mem_z, dfWide$group)
+t.test(dfWide$cor_cur_mem_z ~ dfWide$group)
+effsize::cohen.d(dfWide$cor_cur_mem_z, f = dfWide$group)
+```
+
+
+#### Curiosity-driven memory enhancement (CDMB)
+
+Previous research (Gruber et al., 2014) has quantified the effects of curiosity on memory using an index referred to as curiosity-motivated learning index, comparing the number of items later remembered vs. forgotten in states of high vs. low curiosity. 
+
+
+$$ CDMB = {\sum_{i=1}^{36} curiosity_{CWC} > 0 * memory_{Dummy} \over \sum_{i=1}^{36} curiosity_{CWC} > 0 \ } - {\sum_{i=1}^{36} curiosity_{CWC} < 0 * memory_{Dummy} \over \sum_{i=1}^{36} curiosity_{CWC} < 0 \ } $$
+
+As such, the CDMB computes the ratio between items remembered eliciting high ratings of curiosity to the total number of items eliciting high curiosity ratings and campares it to the ratio of items remembered eliciting low ratings of curiosity compared to the total number of items receiving low curiosity ratings.  
+
+To determine high vs low ratings of curiosity, curiosity was centred within cluster (CWC) and compared against 0.  
+
+When computing the product between curiosity and memory encoding (dummy-coded), mean-centred curiosity ratings can be used as a continuous variable or as a binary variable. In either way, the resulting CDMB are highly correlated with each other (r < .90). To ease the understanding, a binary formulation of mean-centred curiosity is used, allowing for the following definition of CDMB:  
+
+"To compute the effect of curiosity on encoding, the curiosity-driven memory benefit index was computed, i.e., the difference in high confidence recognition memory performance between magic tricks eliciting high ratings of curiosity relative to the total number of magic tricks eliciting high ratings of curiosity and the high confidence recognition memory performance between magic tricks eliciting low ratings of curiosity relative to the total number of magic tricks eliciting low ratings of curiosity."
+
+```{r}
+# two sample t-test to see whether CDMB (dichotomous) differed between both groups
+describe(dfWide$CDMB)
+describe.by(dfWide$CDMB, dfWide$group)
+t.test(dfWide$CDMB ~ dfWide$group)
+effsize::cohen.d(dfWide$CDMB, f = dfWide$group)
+
+# re-run t test after rmoving outlier
+q25 <- as.numeric(quantile(dfWide$CDMB)[2])
+q75 <- as.numeric(quantile(dfWide$CDMB)[4])
+iqr <-  q75 - q25# calculate IQR
+tmp <- subset(dfWide, CDMB >= q25 - 1.5*iqr & CDMB <= q75 + 1.5*iqr) # this removes sub-control049 and sub-experimental018
+t.test(tmp$CDMB ~ tmp$group)
+effsize::cohen.d(tmp$CDMB, f = tmp$group)
+
+```
+
+
+### Relationship between the measures
+
+Below, all behavioural indices described above are combined in a scatter plot matrix.  
+
+While measures quantifying the same construct are highly correlated, measures of different constructs are uncorrelated.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE,  fig.align = "center", fig.height = 10, fig.width = 10, results="asis"}
+
+
+data <- dfWide[,c("BIDS", "group", DV_wide)]
+names(data) <- c("BIDS", "group", effects)
+
+
+p <- ggpairs(data, columns = 3:6, ggplot2::aes(colour=group)) +
+  scale_color_manual(values = wes_palette("Royal1")) + scale_fill_manual(values = wes_palette("Royal1")) +
+  scale_shape_manual(values = c(15,17))
+
+
+ggplotly(p)
+
+cor.test(dfWide$highConf_abs, dfWide$memory_corrected)
+cor.test(dfWide$CDMB, dfWide$cor_cur_mem_z)
+
+```
+
+## Functional connectivity during each phase
+
+```{r plot_fc, echo=FALSE, message=FALSE, warning=FALSE,  fig.align = "center", out.width = '100%', out.height= '100%', fig.height = 7, fig.width = 10, results="asis"}
+# FIGURE S1 A: Functional connectivity (FC) between aHPC and VTA/SN as a function of FWHM kernel and phase #
+
+# change diff
+dfLong_fc$phase <- ifelse(dfLong_fc$phase == phase[1], phase_new[1], 
+                          ifelse(dfLong_fc$phase == phase[2], phase_new[2], 
+                                 ifelse(dfLong_fc$phase == phase[3], phase_new[3], NA)))
+dfLong_fc$smooth <- gsub("s", "FWHM = ", dfLong_fc$smooth)
+
+# rain cloud plot
+graph_fc <- ggplot(dfLong_fc, aes(x=group, y=fc, fill = group)) + 
+  geom_hline(yintercept=0, linetype="dashed", size = 0.5, color="grey") +
+  ggdist::stat_halfeye(adjust = .5, width = .8, .width = 0, justification = -.2, point_colour = NA) + 
+  geom_boxplot(width = .2, outlier.shape = NA) + 
+  ggdist::stat_dots(side = "left", dotsize = .1, justification = 1.2, binwidth = .01, color = "black") +
+  #geom_jitter(size = 0.1, position=position_jitter(0.15)) +
+  theme_classic() +
+  labs(x="Experimental Condition", y="aHPC-VTA/SN-FC") +
+  theme(legend.position="none") +
+  theme(axis.text=element_text(size=axis_text_font_size), axis.title=element_text(size=axis_title_font_size, face="bold"), legend.title = element_text(size=axis_title_font_size), legend.text = element_text(size = axis_title_font_size), strip.text = element_text(size = axis_title_font_size)) +
+  facet_grid(factor(phase, levels = phase_new) ~ smooth) +
+  scale_fill_manual(values = wes_palette("Royal1"))
+print(graph_fc)
+
+# # change labels
+# dfLong_gcor$smooth <- gsub("s", "FWHM = ", dfLong_gcor$smooth)
+# 
+# 
+# # rain cloud plot
+# graph_gcor <- ggplot(dfLong_gcor, aes(x=group, y=gcor, fill = group)) + 
+#   ggdist::stat_halfeye(adjust = .5, width = .8, .width = 0, justification = -.2, point_colour = NA) + 
+#   geom_boxplot(width = .2, outlier.shape = NA) + 
+#   ggdist::stat_dots(side = "left", dotsize = .1, justification = 1.2, binwidth = .01, color = "black") +
+#   #geom_jitter(size = 0.1, position=position_jitter(0.15)) +
+#   theme_classic() +
+#   labs(x="Experimental Condition", y="aHPC-VTA/SN-FC") +
+#   theme(legend.position="none") +
+#   theme(axis.text=element_text(size=axis_text_font_size), axis.title=element_text(size=axis_title_font_size, face="bold"), legend.title = element_text(size=axis_title_font_size), legend.text = element_text(size = axis_title_font_size), strip.text = element_text(size = axis_title_font_size)) +
+#   facet_grid(factor(scan) ~ smooth) +
+#   scale_fill_manual(values = wes_palette("Royal1"))
+# print(graph_gcor)
+
+```
+
+
+### t-Tests for FC values
+
+```{r RSFC}
+# pre learning
+mean(dfWide$FC_pre_s4)
+sd(dfWide$FC_pre_s4)
+
+# post learning
+mean(dfWide$FC_post_s4)
+sd(dfWide$FC_post_s4)
+
+# diff
+mean(dfWide$FC_diff_s4)
+sd(dfWide$FC_diff_s4)
+
+# RSFC change across whole sample
+t.test(dfWide[, "FC_diff_s4"], alternative = "greater")
+effsize::cohen.d(dfWide$FC_diff_s4, f = NA)
+
+# RSFC between both groups
+t.test(dfWide[, "FC_diff_s4"] ~ dfWide$group)
+sd(dfWide$FC_diff_s4[dfWide$group == "cont"])
+sd(dfWide$FC_diff_s4[dfWide$group == "exp"])
+effsize::cohen.d(dfWide$FC_diff_s4, f = dfWide$group)
+
+```
+
+
+```{r ttest, include=FALSE, echo=FALSE}
+# all ttest outputs go as columns
+# each phase goes beneath one table spanner with rows for each fwhm kernel
+
+# create df
+col_ttest <- c("smooth", "mean_all", "test_all", "mean_c", "test_c", "mean_e", "test_e", "mean_diff", "test_diff")
+df_ttest <- setNames(data.frame(matrix(ncol = length(col_ttest), nrow = (length(smooth)*length(phase)+length(phase)+1))), col_ttest)
+
+i <- 1
+for (p in seq_along(phase)) { # for each phase
+  
+  # add spanner
+  i <- i+1
+  df_ttest$smooth[i] <- phase_new[p]
+  
+  for (s in seq_along(smooth)) { # for each smoothing kernel
+    
+    # run t-tests #
+    
+    # whole sample unsmoothed data
+    one_sample <- t.test(dfWide[, paste0("FC_", phase[p], "_", smooth[s])], alternative = c("greater"))
+    # control group unsmoothed data
+    one_sample_c <- t.test(dfWide[dfWide$group == "cont", paste0("FC_", phase[p], "_", smooth[s])], alternative = c("greater"))
+    # Incentives grouo unsmoothed data
+    one_sample_e <- t.test(dfWide[dfWide$group == "exp", paste0("FC_", phase[p], "_", smooth[s])], alternative = c("greater"))
+    # group effect on difference unsmoothed data
+    two_sample <- t.test(dfWide[, paste0("FC_", phase[p], "_", smooth[s])] ~ dfWide$group)
+    
+    
+    # put all info in df #
+    i <- i+1
+    
+    # add loop vars
+    df_ttest$smooth[i] <- gsub("s", "FWHM = ", smooth[s])
+    
+    # one sample
+    df_ttest$mean_all[i] <- paste0(round(one_sample$estimate, digits = 3), " (", round(one_sample$stderr, digits = 3), ")" )
+    pval <- ifelse(round(one_sample$p.value, digits = 3) == 0, "p < 0.001", paste0("p = ", round(one_sample$p.value, digits = 3))) # determine p value
+    df_ttest$test_all[i] <- paste0("t(", round(one_sample$parameter, digits = 2), ") = ", round(one_sample$statistic, digits = 2), ", ", pval )
+    
+    # one sample control
+    df_ttest$mean_c[i] <- paste0(round(one_sample_c$estimate, digits = 3), " (", round(one_sample_c$stderr, digits = 3), ")" )
+    pval <- ifelse(round(one_sample_c$p.value, digits = 3) == 0, "p < 0.001", paste0("p = ", round(one_sample_c$p.value, digits = 3))) # determine p value
+    df_ttest$test_c[i] <- paste0("t(", round(one_sample_c$parameter, digits = 2), ") = ", round(one_sample_c$statistic, digits = 2), ", ", pval )
+    
+    # one sample experimental
+    df_ttest$mean_e[i] <- paste0(round(one_sample_e$estimate, digits = 3), " (", round(one_sample_e$stderr, digits = 3), ")" )
+    pval <- ifelse(round(one_sample_e$p.value, digits = 3) == 0, "p < 0.001", paste0("p = ", round(one_sample_e$p.value, digits = 3))) # determine p value
+    df_ttest$test_e[i] <- paste0("t(", round(one_sample_e$parameter, digits = 2), ") = ", round(one_sample_e$statistic, digits = 2), ", ", pval )
+    
+    # two sample
+    df_ttest$mean_diff[i] <- paste0(round((two_sample$estimate[2] - two_sample$estimate[1]), digits = 3), " (", round(two_sample$stderr, digits = 3), ")" )
+    pval <- ifelse(round(two_sample$p.value, digits = 3) == 0, "p < 0.001", paste0("p = ", round(two_sample$p.value, digits = 3))) # determine p value
+    df_ttest$test_diff[i] <- paste0("t(", round(two_sample$parameter, digits = 2), ") = ", round(two_sample$statistic, digits = 2), ", ", pval )
+    
+    # remove objects
+    rm(one_sample, one_sample_c, one_sample_e, two_sample)
+    
+  }
+}
+
+# change names
+names(df_ttest) <- c("", "Whole sample", "", "Control group", "", "Incentives group", "", "Difference C < I", "")
+
+df_ttest[1,] <- c("", "Mean (SE)", "t-test", "Mean (SE)", "t-test", "Mean (SE)", "t-test", "Mean (SE)", "t-test")
+
+# save file
+xlsx::write.xlsx(df_ttest, file=filename_tables, sheetName = "Table_S0", append = T, row.names = F, showNA = F) # note: row.names contain variables
+
+```
+
+
+## Brain-behaviour correlations
+
+### total # items encoded
+```{r}
+cor <- "pearson"
+# whole sample
+if (cor == "spearman") {
+  DescTools::SpearmanRho(dfWide[, "highConf_abs"], dfWide[, "FC_diff_s4"], conf.level = 0.95)
+} else {
+  cor.test(dfWide[, "highConf_abs"], dfWide[, "FC_diff_s4"])
+}
+# control
+if (cor == "spearman") {
+  cor_cont <- DescTools::SpearmanRho(dfWide[dfWide$group == "cont", "highConf_abs"], dfWide[dfWide$group == "cont", paste0("FC_diff_s4")], conf.level = 0.95)
+} else {
+  cor_cont <- cor.test(dfWide[dfWide$group == "cont", "highConf_abs"], dfWide[dfWide$group == "cont", paste0("FC_diff_s4")])
+}
+cor_cont
+# experimental
+if (cor == "spearman") {
+  cor_exp <- DescTools::SpearmanRho(dfWide[dfWide$group == "exp", "highConf_abs"], dfWide[dfWide$group == "exp", paste0("FC_diff_s4")], conf.level = 0.95)
+} else {
+  cor_exp <- cor.test(dfWide[dfWide$group == "exp", "highConf_abs"], dfWide[dfWide$group == "exp", paste0("FC_diff_s4")])
+}
+cor_exp
+
+# group effect
+if (cor == "spearman") {
+  cocor::cocor.indep.groups(cor_exp[1], cor_cont[1], 25, 25, alternative = "two.sided",
+                            test = "all", alpha = 0.05, conf.level = 0.95, null.value = 0,
+                            data.name = NULL, var.labels = NULL, return.htest = FALSE)
+} else {
+  cocor::cocor.indep.groups(cor_exp$estimate, cor_cont$estimate, 25, 25, alternative = "two.sided",
+                            test = "all", alpha = 0.05, conf.level = 0.95, null.value = 0,
+                            data.name = NULL, var.labels = NULL, return.htest = FALSE)
+}
+
+```
+### Curiosity-driven memory benefit
+```{r}
+cor <- "pearson"
+# whole sample
+if (cor == "spearman") {
+  DescTools::SpearmanRho(dfWide[, "CDMB"], dfWide[, "FC_diff_s4"], conf.level = 0.95)
+} else {
+  cor.test(dfWide[, "CDMB"], dfWide[, "FC_diff_s4"])
+}
+# control
+if (cor == "spearman") {
+  cor_cont <- DescTools::SpearmanRho(dfWide[dfWide$group == "cont", "CDMB"], dfWide[dfWide$group == "cont", paste0("FC_diff_s4")], conf.level = 0.95)
+} else {
+  cor_cont <- cor.test(dfWide[dfWide$group == "cont", "CDMB"], dfWide[dfWide$group == "cont", paste0("FC_diff_s4")])
+}
+cor_cont
+# experimental
+if (cor == "spearman") {
+  cor_exp <- DescTools::SpearmanRho(dfWide[dfWide$group == "exp", "CDMB"], dfWide[dfWide$group == "exp", paste0("FC_diff_s4")], conf.level = 0.95)
+} else {
+  cor_exp <- cor.test(dfWide[dfWide$group == "exp", "CDMB"], dfWide[dfWide$group == "exp", paste0("FC_diff_s4")])
+}
+cor_exp
+
+# group effect
+if (cor == "spearman") {
+  cocor::cocor.indep.groups(cor_exp[1], cor_cont[1], 25, 25, alternative = "two.sided",
+                            test = "all", alpha = 0.05, conf.level = 0.95, null.value = 0,
+                            data.name = NULL, var.labels = NULL, return.htest = FALSE)
+} else {
+  cocor::cocor.indep.groups(cor_exp$estimate, cor_cont$estimate, 25, 25, alternative = "two.sided",
+                            test = "all", alpha = 0.05, conf.level = 0.95, null.value = 0,
+                            data.name = NULL, var.labels = NULL, return.htest = FALSE)
+  r_cmle <- cocor::cocor.indep.groups(cor_exp$estimate, cor_cont$estimate, 25, 25, alternative = "two.sided",
+                            test = "all", alpha = 0.05, conf.level = 0.95, null.value = 0,
+                            data.name = NULL, var.labels = NULL, return.htest = FALSE)
+}
+
+```
+
+
+#### Figure 3
+```{r, echo=FALSE, message=FALSE, warning=FALSE,  fig.align = "center", out.width = '100%', out.height= '100%', fig.height = 7, fig.width = 10, results="asis"}
+# determine variables 
+var1 <- "highConf_abs"
+var2 <- "CDMB"
+dv <- "FC_diff_s4"
+
+label1 <- "Total # items encoded"
+label2 <- "Curiosity-driven memory benefit"
+
+# compute stats
+t_rsfc <- t.test(dfWide[, dv] ~ dfWide$group)$p.value
+t1 <- t.test(dfWide[, var1] ~ dfWide$group)$p.value
+t2 <- t.test(dfWide[, var2] ~ dfWide$group)$p.value
+
+cor_cont <- cor.test(dfWide[dfWide$group == "cont", var1], dfWide[dfWide$group == "cont", dv])
+cor_exp <- cor.test(dfWide[dfWide$group == "exp", var1], dfWide[dfWide$group == "exp", dv])
+r1 <- cocor::cocor.indep.groups(cor_exp$estimate, cor_cont$estimate, 25, 25, alternative = "two.sided",
+                            test = "all", alpha = 0.05, conf.level = 0.95, null.value = 0,
+                            data.name = NULL, var.labels = NULL, return.htest = FALSE) 
+
+cor_cont <- cor.test(dfWide[dfWide$group == "cont", var2], dfWide[dfWide$group == "cont", dv])
+cor_exp <- cor.test(dfWide[dfWide$group == "exp", var2], dfWide[dfWide$group == "exp", dv])
+r2 <- cocor::cocor.indep.groups(cor_exp$estimate, cor_cont$estimate, 25, 25, alternative = "two.sided",
+                            test = "all", alpha = 0.05, conf.level = 0.95, null.value = 0,
+                            data.name = NULL, var.labels = NULL, return.htest = FALSE) 
+
+# create dataframe for plotting
+data_plot <- dfWide[,c("ID", "group", dv, var1, var2)]
+data_plot <- reshape2::melt(data_plot, id=c("ID", "group", dv))
+data_plot$value_scaled <- ifelse(data_plot$variable == var1, scale(dfWide[, var1]),
+                                 scale(dfWide[, var2])) # scale x variables for plotting
+data_plot$group <- ifelse(data_plot$group == "cont", "Control", "Incentives")
+data_plot$variable <- ifelse(data_plot$variable == var1, label1, label2)
+data_plot$variable <- factor(data_plot$variable, levels = c(label1, label2))
+data_plot$t_brain <- paste0('p = ', round(t_rsfc, 3))
+data_plot$t_brain <- factor(data_plot$t_brain, labels = sprintf('italic(p) == %.3f', round(t_rsfc, 3)))
+data_plot$t_behav <- ifelse(data_plot$variable == label1, paste0('p = ', round(t1, 3)), paste0('p = ', round(t2, 3)))
+data_plot$t_behav <- factor(data_plot$t_behav, 
+                            levels = c(paste0('p = ', round(t1, 3)), paste0('p = ', round(t2, 3))),
+                            labels = c(sprintf('italic(p) == %.3f', round(t1, 3)), sprintf('italic(p) == %.3f', round(t2, 3))))
+
+# create labels
+label.sep <- paste0("*`,`~")
+labels <- data.frame(
+  variable = c(label1, label2), 
+                     label = c(sprintf('italic(Delta~(r)) == %.2f*`,`~italic(p) == %.3f ', round(r1@diff, 2), round(r1@fisher1925$p.value, 3)), 
+                               sprintf('italic(Delta~(r)) == %.2f*`,`~italic(p) == %.3f ', round(r2@diff, 2), round(r2@fisher1925$p.value, 3))))
+
+# create scatter plot for each group separately
+scatter <- ggplot(data_plot, aes(x=value, y=get(paste0(dv)), col = group, fill = group, shape = group)) + 
+  geom_smooth(formula = y ~ x, method=lm, aes(fill=group), alpha = 0.3, fullrange = T, size = 0.5) +
+  geom_point() +
+  theme_classic() +
+  labs(x="Behavioural measures of learning", y="aHPC-VTA/SN-RSFC change", fill = "Group", col  = "Group") +
+  theme(axis.text=element_text(size=axis_text_font_size), axis.title=element_text(size=axis_title_font_size, face="bold"), legend.title = element_text(size=axis_title_font_size, face = "bold"), legend.text = element_text(size = axis_title_font_size), strip.text = element_text(size = axis_title_font_size)) +
+  scale_color_manual(values = wes_palette("Royal1")) + scale_fill_manual(values = wes_palette("Royal1")) +
+  scale_shape_manual(values = c(15,17)) +
+  labs(color  = "Experimental condition", fill = "Experimental condition", shape = "Experimental condition") +
+  facet_grid(. ~ variable, scales = "free") +
+  ggpubr::stat_cor(method = "pearson", show.legend = F, cor.coef.name = "r", label.x.npc = "left",label.y.npc = "top") +
+  coord_cartesian(ylim = c(-0.1, 0.1)) +
+  geom_text(aes(label = label, x = -Inf, y = -0.1), data = labels, parse = TRUE, hjust = -0.05, inherit.aes = FALSE)
+#print(scatter)
+
+
+# create boxplot for x variables (i.e., behavioural measures of learning)
+x_box <- ggplot(data_plot, aes(x = group, y = value_scaled, fill = group)) + 
+  geom_flat_violin(trim = F, alpha = .3, colour = NA) + geom_boxplot(width = .1, outlier.size = 0.5) +
+  theme_classic() +
+  labs(x="", fill = "Group", y = "") +
+  theme(axis.text=element_text(size=axis_text_font_size), axis.title=element_text(size=axis_title_font_size, face="bold"), legend.title = element_text(size=axis_title_font_size, face = "bold"), legend.text = element_text(size = axis_title_font_size), strip.text = element_text(size = axis_title_font_size)) +
+  scale_color_manual(values = wes_palette("Royal1")) + scale_fill_manual(values = wes_palette("Royal1")) +
+  scale_shape_manual(values = c(15,17)) +
+  labs(color  = "Experimental condition", fill = "Experimental condition", shape = "Experimental condition") +
+  theme(legend.position = "none") + theme(axis.text = element_blank()) +
+  facet_grid(. ~ t_behav, scales = "free", labeller = label_parsed) + 
+  coord_flip() + 
+  theme(strip.background = element_blank()) 
+#print(x_box)
+
+# create boxplot for y variable (i.e., RSFC change)
+y_box <- ggplot(data_plot, aes(x = group, y = FC_diff_s4, fill = group)) + 
+  geom_flat_violin(trim = F, alpha = .3, colour = NA) + geom_boxplot(width = .1, outlier.size = 0.5) +
+  theme_classic() +
+  labs(x="", fill = "Group", y = "") +
+  theme(axis.text=element_text(size=axis_text_font_size), axis.title=element_text(size=axis_title_font_size, face="bold"), legend.title = element_text(size=axis_title_font_size, face = "bold"), legend.text = element_text(size = axis_title_font_size), strip.text = element_text(size = axis_title_font_size)) +
+  scale_color_manual(values = wes_palette("Royal1")) + scale_fill_manual(values = wes_palette("Royal1")) +
+  scale_shape_manual(values = c(15,17)) +
+  labs(color  = "Experimental condition", fill = "Experimental condition", shape = "Experimental condition") +
+  theme(legend.position = "none") + theme(axis.text = element_blank()) +
+  facet_grid(. ~t_brain, labeller = label_parsed) + theme(strip.background = element_blank()) +
+  coord_cartesian(ylim = c(-0.1, 0.1))
+#print(y_box)
+
+# combine to plot
+legend <- get_legend(scatter) # extract legend into seperate plot
+scatter <- scatter + theme(legend.position='none') # remove legend from scatter plot
+# combine all in a grid
+plot_grid(
+  x_box, legend, scatter, y_box,
+  align = 'hv', axis = "tblr",
+  rel_heights = c(4,10),
+  rel_widths = c(10,4)
+)
+
+ggsave("figure_3.jpeg", units = "cm", width = 20, height = 16)
+
+```
+
+
+### corrected memory
+```{r}
+# whole sample
+cor.test(dfWide[, "memory_corrected"], dfWide[, "FC_diff_s4"])
+
+# control
+cor_cont <- cor.test(dfWide[dfWide$group == "cont", "memory_corrected"], dfWide[dfWide$group == "cont", paste0("FC_diff_s4")])
+
+# experimental
+cor_exp <- cor.test(dfWide[dfWide$group == "exp", "memory_corrected"], dfWide[dfWide$group == "exp", paste0("FC_diff_s4")])
+
+# group effect
+cocor::cocor.indep.groups(cor_exp$estimate, cor_cont$estimate, 25, 25, alternative = "two.sided",
+                          test = "all", alpha = 0.05, conf.level = 0.95, null.value = 0,
+                          data.name = NULL, var.labels = NULL, return.htest = FALSE)
+
+```
+
+### within-person correlation
+```{r}
+# whole sample
+cor.test(dfWide[, "cor_cur_mem_z"], dfWide[, "FC_diff_s4"])
+# control
+cor_cont <- cor.test(dfWide[dfWide$group == "cont", "cor_cur_mem_z"], dfWide[dfWide$group == "cont", paste0("FC_diff_s4")])
+cor_cont
+# experimental
+cor_exp <- cor.test(dfWide[dfWide$group == "exp", "cor_cur_mem_z"], dfWide[dfWide$group == "exp", paste0("FC_diff_s4")])
+cor_exp
+
+# group effect
+cocor::cocor.indep.groups(cor_exp$estimate, cor_cont$estimate, 25, 25, alternative = "two.sided",
+                          test = "all", alpha = 0.05, conf.level = 0.95, null.value = 0,
+                          data.name = NULL, var.labels = NULL, return.htest = FALSE)
+```
+
+
+#### Figure S1
+```{r, echo=FALSE, message=FALSE, warning=FALSE,  fig.align = "center", out.width = '100%', out.height= '100%', fig.height = 7, fig.width = 10, results="asis"}
+# determine variables 
+var1 <- "memory_corrected"
+var2 <- "cor_cur_mem_z"
+dv <- "FC_diff_s4"
+
+label1 <- "Total # items corrected"
+label2 <- "Within-person correlation"
+
+# compute stats
+t_rsfc <- t.test(dfWide[, dv] ~ dfWide$group)$p.value
+t1 <- t.test(dfWide[, var1] ~ dfWide$group)$p.value
+t2 <- t.test(dfWide[, var2] ~ dfWide$group)$p.value
+
+cor_cont <- cor.test(dfWide[dfWide$group == "cont", var1], dfWide[dfWide$group == "cont", dv])
+cor_exp <- cor.test(dfWide[dfWide$group == "exp", var1], dfWide[dfWide$group == "exp", dv])
+r1 <- cocor::cocor.indep.groups(cor_exp$estimate, cor_cont$estimate, 25, 25, alternative = "two.sided",
+                            test = "all", alpha = 0.05, conf.level = 0.95, null.value = 0,
+                            data.name = NULL, var.labels = NULL, return.htest = FALSE) 
+
+cor_cont <- cor.test(dfWide[dfWide$group == "cont", var2], dfWide[dfWide$group == "cont", dv])
+cor_exp <- cor.test(dfWide[dfWide$group == "exp", var2], dfWide[dfWide$group == "exp", dv])
+r2 <- cocor::cocor.indep.groups(cor_exp$estimate, cor_cont$estimate, 25, 25, alternative = "two.sided",
+                            test = "all", alpha = 0.05, conf.level = 0.95, null.value = 0,
+                            data.name = NULL, var.labels = NULL, return.htest = FALSE) 
+
+# create dataframe for plotting
+data_plot <- dfWide[,c("ID", "group", dv, var1, var2)]
+data_plot <- reshape2::melt(data_plot, id=c("ID", "group", dv))
+data_plot$value_scaled <- ifelse(data_plot$variable == var1, scale(dfWide[, var1]),
+                                 scale(dfWide[, var2])) # scale x variables for plotting
+data_plot$group <- ifelse(data_plot$group == "cont", "Control", "Incentives")
+data_plot$variable <- ifelse(data_plot$variable == var1, label1, label2)
+data_plot$variable <- factor(data_plot$variable, levels = c(label1, label2))
+data_plot$t_brain <- paste0('p = ', round(t_rsfc, 3))
+data_plot$t_brain <- factor(data_plot$t_brain, labels = sprintf('italic(p) == %.3f', round(t_rsfc, 3)))
+data_plot$t_behav <- ifelse(data_plot$variable == label1, paste0('p = ', round(t1, 3)), paste0('p = ', round(t2, 3)))
+data_plot$t_behav <- factor(data_plot$t_behav, 
+                            levels = c(paste0('p = ', round(t1, 3)), paste0('p = ', round(t2, 3))),
+                            labels = c(sprintf('italic(p) == %.3f', round(t1, 3)), sprintf('italic(p) == %.3f', round(t2, 3))))
+
+# create labels
+label.sep <- paste0("*`,`~")
+labels <- data.frame(
+  variable = c(label1, label2), 
+                     label = c(sprintf('italic(Delta~(r)) == %.2f*`,`~italic(p) == %.3f ', round(r1@diff, 2), round(r1@fisher1925$p.value, 3)), 
+                               sprintf('italic(Delta~(r)) == %.2f*`,`~italic(p) == %.3f ', round(r2@diff, 2), round(r2@fisher1925$p.value, 3))))
+
+# create scatter plot for each group separately
+scatter <- ggplot(data_plot, aes(x=value, y=get(paste0(dv)), col = group, fill = group, shape = group)) + 
+  geom_smooth(formula = y ~ x, method=lm, aes(fill=group), alpha = 0.3, fullrange = T, size = 0.5) +
+  geom_point() +
+  theme_classic() +
+  labs(x="Behavioural measures of learning", y="aHPC-VTA/SN-RSFC change", fill = "Group", col  = "Group") +
+  theme(axis.text=element_text(size=axis_text_font_size), axis.title=element_text(size=axis_title_font_size, face="bold"), legend.title = element_text(size=axis_title_font_size, face = "bold"), legend.text = element_text(size = axis_title_font_size), strip.text = element_text(size = axis_title_font_size)) +
+  scale_color_manual(values = wes_palette("Royal1")) + scale_fill_manual(values = wes_palette("Royal1")) +
+  scale_shape_manual(values = c(15,17)) +
+  labs(color  = "Experimental condition", fill = "Experimental condition", shape = "Experimental condition") +
+  facet_grid(. ~ variable, scales = "free") +
+  ggpubr::stat_cor(method = "pearson", show.legend = F, cor.coef.name = "r", label.x.npc = "left",label.y.npc = "top") +
+  coord_cartesian(ylim = c(-0.1, 0.1)) +
+  geom_text(aes(label = label, x = -Inf, y = -0.1), data = labels, parse = TRUE, hjust = -0.05, inherit.aes = FALSE)
+#print(scatter)
+
+
+# create boxplot for x variables (i.e., behavioural measures of learning)
+x_box <- ggplot(data_plot, aes(x = group, y = value_scaled, fill = group)) + 
+  geom_flat_violin(trim = F, alpha = .3, colour = NA) + geom_boxplot(width = .1, outlier.size = 0.5) +
+  theme_classic() +
+  labs(x="", fill = "Group", y = "") +
+  theme(axis.text=element_text(size=axis_text_font_size), axis.title=element_text(size=axis_title_font_size, face="bold"), legend.title = element_text(size=axis_title_font_size, face = "bold"), legend.text = element_text(size = axis_title_font_size), strip.text = element_text(size = axis_title_font_size)) +
+  scale_color_manual(values = wes_palette("Royal1")) + scale_fill_manual(values = wes_palette("Royal1")) +
+  scale_shape_manual(values = c(15,17)) +
+  labs(color  = "Experimental condition", fill = "Experimental condition", shape = "Experimental condition") +
+  theme(legend.position = "none") + theme(axis.text = element_blank()) +
+  facet_grid(. ~ t_behav, scales = "free", labeller = label_parsed) + 
+  coord_flip() + 
+  theme(strip.background = element_blank()) 
+#print(x_box)
+
+# create boxplot for y variable (i.e., RSFC change)
+y_box <- ggplot(data_plot, aes(x = group, y = FC_diff_s4, fill = group)) + 
+  geom_flat_violin(trim = F, alpha = .3, colour = NA) + geom_boxplot(width = .1, outlier.size = 0.5) +
+  theme_classic() +
+  labs(x="", fill = "Group", y = "") +
+  theme(axis.text=element_text(size=axis_text_font_size), axis.title=element_text(size=axis_title_font_size, face="bold"), legend.title = element_text(size=axis_title_font_size, face = "bold"), legend.text = element_text(size = axis_title_font_size), strip.text = element_text(size = axis_title_font_size)) +
+  scale_color_manual(values = wes_palette("Royal1")) + scale_fill_manual(values = wes_palette("Royal1")) +
+  scale_shape_manual(values = c(15,17)) +
+  labs(color  = "Experimental condition", fill = "Experimental condition", shape = "Experimental condition") +
+  theme(legend.position = "none") + theme(axis.text = element_blank()) +
+  facet_grid(. ~t_brain, labeller = label_parsed) + theme(strip.background = element_blank()) +
+  coord_cartesian(ylim = c(-0.1, 0.1))
+#print(y_box)
+
+# combine to plot
+legend <- get_legend(scatter) # extract legend into seperate plot
+scatter <- scatter + theme(legend.position='none') # remove legend from scatter plot
+# combine all in a grid
+plot_grid(
+  x_box, legend, scatter, y_box,
+  align = 'hv', axis = "tblr",
+  rel_heights = c(4,10),
+  rel_widths = c(10,4)
+)
+
+ggsave("Figure_S1.jpeg", units = "cm", width = 20, height = 16)
+
+```
+
+
+### total # items encoded - Spearman
+```{r}
+cor <- "spearman"
+# whole sample
+if (cor == "spearman") {
+  DescTools::SpearmanRho(dfWide[, "highConf_abs"], dfWide[, "FC_diff_s4"], conf.level = 0.95)
+} else {
+  cor.test(dfWide[, "highConf_abs"], dfWide[, "FC_diff_s4"])
+}
+# control
+if (cor == "spearman") {
+  cor_cont <- DescTools::SpearmanRho(dfWide[dfWide$group == "cont", "highConf_abs"], dfWide[dfWide$group == "cont", paste0("FC_diff_s4")], conf.level = 0.95)
+} else {
+  cor_cont <- cor.test(dfWide[dfWide$group == "cont", "highConf_abs"], dfWide[dfWide$group == "cont", paste0("FC_diff_s4")])
+}
+cor_cont
+# experimental
+if (cor == "spearman") {
+  cor_exp <- DescTools::SpearmanRho(dfWide[dfWide$group == "exp", "highConf_abs"], dfWide[dfWide$group == "exp", paste0("FC_diff_s4")], conf.level = 0.95)
+} else {
+  cor_exp <- cor.test(dfWide[dfWide$group == "exp", "highConf_abs"], dfWide[dfWide$group == "exp", paste0("FC_diff_s4")])
+}
+cor_exp
+
+# group effect
+if (cor == "spearman") {
+  cocor::cocor.indep.groups(cor_exp[1], cor_cont[1], 25, 25, alternative = "two.sided",
+                            test = "all", alpha = 0.05, conf.level = 0.95, null.value = 0,
+                            data.name = NULL, var.labels = NULL, return.htest = FALSE)
+} else {
+  cocor::cocor.indep.groups(cor_exp$estimate, cor_cont$estimate, 25, 25, alternative = "two.sided",
+                            test = "all", alpha = 0.05, conf.level = 0.95, null.value = 0,
+                            data.name = NULL, var.labels = NULL, return.htest = FALSE)
+}
+
+```
+### Curiosity-driven memory benefit - Spearman
+```{r}
+cor <- "spearman"
+# whole sample
+if (cor == "spearman") {
+  DescTools::SpearmanRho(dfWide[, "CDMB"], dfWide[, "FC_diff_s4"], conf.level = 0.95)
+} else {
+  cor.test(dfWide[, "CDMB"], dfWide[, "FC_diff_s4"])
+}
+# control
+if (cor == "spearman") {
+  cor_cont <- DescTools::SpearmanRho(dfWide[dfWide$group == "cont", "CDMB"], dfWide[dfWide$group == "cont", paste0("FC_diff_s4")], conf.level = 0.95)
+} else {
+  cor_cont <- cor.test(dfWide[dfWide$group == "cont", "CDMB"], dfWide[dfWide$group == "cont", paste0("FC_diff_s4")])
+}
+cor_cont
+# experimental
+if (cor == "spearman") {
+  cor_exp <- DescTools::SpearmanRho(dfWide[dfWide$group == "exp", "CDMB"], dfWide[dfWide$group == "exp", paste0("FC_diff_s4")], conf.level = 0.95)
+} else {
+  cor_exp <- cor.test(dfWide[dfWide$group == "exp", "CDMB"], dfWide[dfWide$group == "exp", paste0("FC_diff_s4")])
+}
+cor_exp
+
+# group effect
+if (cor == "spearman") {
+  cocor::cocor.indep.groups(cor_exp[1], cor_cont[1], 25, 25, alternative = "two.sided",
+                            test = "all", alpha = 0.05, conf.level = 0.95, null.value = 0,
+                            data.name = NULL, var.labels = NULL, return.htest = FALSE)
+} else {
+  cocor::cocor.indep.groups(cor_exp$estimate, cor_cont$estimate, 25, 25, alternative = "two.sided",
+                            test = "all", alpha = 0.05, conf.level = 0.95, null.value = 0,
+                            data.name = NULL, var.labels = NULL, return.htest = FALSE)
+}
+
+```
+
+
+```{r brain_behav_cor, include=FALSE, echo=FALSE}
+
+col_shapiro <- c("var", "stat_all", "p_all", "stat_cont", "p_cont", "stat_exp", "p_exp")
+
+df_shapiro <- setNames(data.frame(matrix(ncol = length(col_shapiro), nrow = (length(DV_wide)+length(smooth)))), col_shapiro)
+
+
+for (p in seq_along(phase)) { # for each phase
+  
+  # loop through the variables
+  for(DV in 1:length(DV_wide)) {
+    
+    # create df
+    temp <- data.frame(phase = character(length(smooth)),
+                       smooth = character(length(smooth)),
+                       category = character(length(smooth)),
+                       
+                       cor = numeric(length(smooth)),
+                       ci_l = numeric(length(smooth)),
+                       ci_u = numeric(length(smooth)),
+                       pval = numeric(length(smooth)),
+                       cor_cont = numeric(length(smooth)),
+                       ci_l_cont = numeric(length(smooth)),
+                       ci_u_cont = numeric(length(smooth)),
+                       pval_cor_cont = numeric(length(smooth)),
+                       cor_exp = numeric(length(smooth)),
+                       ci_l_exp = numeric(length(smooth)),
+                       ci_u_exp = numeric(length(smooth)),
+                       pval_cor_exp = numeric(length(smooth)),
+                       corrDiff = numeric(length(smooth)),
+                       ci_l_corrDiff = numeric(length(smooth)),
+                       ci_u_corrDiff = numeric(length(smooth)),
+                       pval_corrDiff = numeric(length(smooth)),
+                       
+                       stringsAsFactors=FALSE)
+    
+    # test for normality distribution for each behavioural variable #
+    
+    df_shapiro$var[DV] <- paste(DV_wide[DV])
+    
+    # whole sample
+    shapiro <- shapiro.test(dfWide[, paste(DV_wide[DV])])
+    df_shapiro$stat_all[DV] <- round(shapiro$statistic, digits = 3)
+    df_shapiro$p_all[DV] <- round(shapiro$p.value, digits = 3)
+    
+    # control 
+    shapiro <- shapiro.test(dfWide[dfWide$group == "cont", paste(DV_wide[DV])])
+    df_shapiro$stat_cont[DV] <- round(shapiro$statistic, digits = 3)
+    df_shapiro$p_cont[DV] <- round(shapiro$p.value, digits = 3)
+    
+    # control experimental
+    shapiro <- shapiro.test(dfWide[dfWide$group == "exp", paste(DV_wide[DV])])
+    df_shapiro$stat_exp[DV] <- round(shapiro$statistic, digits = 3)
+    df_shapiro$p_exp[DV] <- round(shapiro$p.value, digits = 3)
+    
+    rm(shapiro)
+    
+    
+    
+    
+    
+    for (s in seq_along(smooth)) { # for each smoothing kernel
+      # for all dependent variables compute correlation between changes in RSFC and memory for whole sample as well as in each group
+      
+      
+      # test for normality distribution for each change in RSFC #
+      
+      if (p == 1) {
+        
+        df_shapiro$var[DV+s] <- paste0("FC_", phase[p], "_", smooth[s])
+        
+        # whole sample
+        shapiro <- shapiro.test(dfWide[, paste0("FC_", phase[p], "_", smooth[s])])
+        df_shapiro$stat_all[DV+s] <- round(shapiro$statistic, digits = 3)
+        df_shapiro$p_all[DV+s] <- round(shapiro$p.value, digits = 3)
+        
+        # control 
+        shapiro <- shapiro.test(dfWide[dfWide$group == "cont", paste0("FC_", phase[p], "_", smooth[s])])
+        df_shapiro$stat_cont[DV+s] <- round(shapiro$statistic, digits = 3)
+        df_shapiro$p_cont[DV+s] <- round(shapiro$p.value, digits = 3)
+        
+        # control experimental
+        shapiro <- shapiro.test(dfWide[dfWide$group == "exp", paste0("FC_", phase[p], "_", smooth[s])])
+        df_shapiro$stat_exp[DV+s] <- round(shapiro$statistic, digits = 3)
+        df_shapiro$p_exp[DV+s] <- round(shapiro$p.value, digits = 3)
+        
+        rm(shapiro)
+        
+      }
+      
+      
+      # fill in table # 
+      
+      # paste variable
+      temp$phase[s] <- phase_new[p]
+      temp$smooth[s] <- gsub("s", "FWHM = ", smooth[s])
+      
+      temp$category[s] <- paste0(effects[DV])
+      
+      # compute correlarion whole sample
+      cor <- cor.test(dfWide[, paste(DV_wide[DV])], dfWide[, paste0("FC_", phase[p], "_", smooth[s])])
+      # cor <- cor.test(dfWide[, paste(DV_wide[DV])], dfWide[, paste0("FC_", phase[p], "_", smooth[s])], method = "spearman", exact=FALSE)
+      temp$cor[s] <- cor$estimate # correlation
+      temp$ci_l[s] <- cor$conf.int[1] # ci
+      temp$ci_u[s] <- cor$conf.int[2] # ci
+      temp$pval[s] <- cor$p.value # p value
+      
+      # compute correlation control group
+      cor_cont <- cor.test(dfWide[dfWide$group == "cont", paste(DV_wide[DV])], dfWide[dfWide$group == "cont", paste0("FC_", phase[p], "_", smooth[s])])
+      #cor_cont <- cor.test(dfWide[dfWide$group == "cont", paste(DV_wide[DV])], dfWide[dfWide$group == "cont", paste0("FC_", phase[p], "_", smooth[s])], method = "spearman", exact=FALSE)
+      temp$cor_cont[s] <- cor_cont$estimate # correlation
+      temp$ci_l_cont[s] <- cor_cont$conf.int[1] # ci
+      temp$ci_u_cont[s] <- cor_cont$conf.int[2] # ci
+      temp$pval_cor_cont[s] <-cor_cont$p.value # p value
+      
+      # compute correlation experimental group
+      cor_exp <- cor.test(dfWide[dfWide$group == "exp", paste(DV_wide[DV])], dfWide[dfWide$group == "exp", paste0("FC_", phase[p], "_", smooth[s])])#, method = "spearman")
+      #cor_exp <- cor.test(dfWide[dfWide$group == "exp", paste(DV_wide[DV])], dfWide[dfWide$group == "exp", paste0("FC_", phase[p], "_", smooth[s])], method = "spearman", exact=FALSE)
+      temp$cor_exp[s] <- cor_exp$estimate # correlation
+      temp$ci_l_exp[s] <- cor_exp$conf.int[1] # ci
+      temp$ci_u_exp[s] <- cor_exp$conf.int[2] # ci
+      temp$pval_cor_exp[s] <-cor_exp$p.value # p value
+      # check for group diff in correlation
+      corDiff <- cocor::cocor.indep.groups(cor_exp$estimate, cor_cont$estimate, 25, 25, alternative = "two.sided",
+                                           test = "all", alpha = 0.05, conf.level = 0.95, null.value = 0,
+                                           data.name = NULL, var.labels = NULL, return.htest = FALSE)
+      temp$corrDiff[s] <- corDiff@diff
+      temp$ci_l_corrDiff[s] <- corDiff@zou2007$conf.int[1] # ci
+      temp$ci_u_corrDiff[s] <- corDiff@zou2007$conf.int[2] # ci
+      temp$pval_corrDiff[s] <- corDiff@fisher1925$p.value
+      
+      # round values
+      temp[, 4:19] <- round(temp[, 4:19], digits = 3)
+      
+      rm(cor, cor_cont, cor_exp, corDiff)
+      
+    }
+    
+    # combine data
+    if (DV == 1 & p == 1) {
+      df_brainbehav <- temp
+    } else {
+      df_brainbehav <- rbind(df_brainbehav, temp)
+    }
+    
+    rm(temp)
+    
+  }  
+  
+}
+
+
+```
+
+
+
+## Brain-encoding correlations as a function of smoothing kernels
+
+FC connectivity during consolidation (i.e. changes in RSFC between HPC & midbrain) and encoding (task FC between HPC & midbrain) were correlated with the behavioural measurements of learning. This was done separately for each smoothing kernel applied during pre-processing. 
+
+Below, a graph was created for each behavioural measurement of learning plotting the different memory levels on the y-axis and correlation coefficients and their 95% confidence interval on the x-axis (dashed line is equivalent to r = 0). Correlation values were plotted for the whole sample and seperately for control- and incentives group. Additionally, their difference was plotted. Different colours and shape indicate different smoothing kernels (see legend). Data from the consolidation was plotted on the left side, whereas data on the right stems from encoding. The data used in the plot can be found at the end of the paper in form from tables.
+
+```{r plots, echo=FALSE, message=FALSE, warning=FALSE,  fig.align = "center", out.width = '100%', out.height= '100%', fig.height = 13, fig.width = 10, results="asis"}
+# prepare data in long format
+cor <- df_brainbehav[,c("phase", "smooth", "category", "cor", "cor_exp", "cor_cont", "corrDiff")]
+cor <- reshape2::melt(cor, id=c("phase", "smooth", "category"))
+cor$index <- ifelse(grepl("_exp", cor$variable), "Incentives group",
+                    ifelse(grepl("_cont", cor$variable), "Control group",
+                           ifelse(grepl("corrDiff", cor$variable), "Difference C < I", "Whole sample")))
+cor$cor <- cor$value
+cor$variable <- NULL
+cor$value <- NULL
+
+# upper ci
+ci_u <- df_brainbehav[,c("phase", "smooth", "category", "ci_u", "ci_u_exp", "ci_u_cont", "ci_u_corrDiff")]
+ci_u <- reshape2::melt(ci_u, id=c("phase", "smooth", "category"))
+ci_u$index <- ifelse(grepl("_exp", ci_u$variable), "Incentives group",
+                     ifelse(grepl("_cont", ci_u$variable), "Control group",
+                            ifelse(grepl("corrDiff", ci_u$variable), "Difference C < I", "Whole sample")))
+ci_u$ci_u <- ci_u$value
+ci_u$variable <- NULL
+ci_u$value <- NULL
+
+# lower ci
+ci_l <- df_brainbehav[,c("phase", "smooth", "category", "ci_l", "ci_l_exp", "ci_l_cont", "ci_l_corrDiff")]
+ci_l <- reshape2::melt(ci_l, id=c("phase", "smooth", "category"))
+ci_l$index <- ifelse(grepl("_exp", ci_l$variable), "Incentives group",
+                     ifelse(grepl("_cont", ci_l$variable), "Control group",
+                            ifelse(grepl("corrDiff", ci_l$variable), "Difference C < I", "Whole sample")))
+ci_l$ci_l <- ci_l$value
+ci_l$variable <- NULL
+ci_l$value <- NULL
+
+
+# MERGE
+df_plot <- merge(cor, ci_l, by = c("phase", "smooth", "category", "index"))
+df_plot <- merge(df_plot, ci_u, by = c("phase", "smooth", "category", "index"))
+
+df_plot$memory <- "High confidence recognition"
+
+
+# loop though all categories
+
+for (DV in seq_along(DV_wide)) {
+  
+  #cat("  \n####", paste0(effects[DV]))  
+  
+  # subset data
+  data_plot <- df_plot[df_plot$category == paste0(effects[DV]),]
+  
+  # ggplot command
+  plot <- ggplot(data_plot, aes(x=memory, y=cor, colour = smooth)) +
+    geom_hline(yintercept=0, linetype="dashed", size = 0.5, color="grey") +
+    geom_point(size = 2, aes(shape = smooth, colour = smooth),position=position_dodge(width=0.5)) +
+    geom_errorbar(aes(ymin=ci_l, ymax=ci_u), width=.1, size = 0.5, position=position_dodge(width=0.5)) +
+    facet_grid(factor(phase, levels = phase_new) ~ factor(index, levels = c("Whole sample","Control group", "Incentives group","Difference C < I"))) +  
+    theme_classic() + 
+    scale_color_manual(values=wes_palette(n=4, name="IsleofDogs2")) + 
+    labs(x="", color = "3dBlurToFWHM", y = "Correlation measurement", title = paste0(effects[DV])) +
+    guides(colour = guide_legend("3dBlurToFWHM"), shape = guide_legend("3dBlurToFWHM"), mapping = guide_legend("3dBlurToFWHM")) + 
+    theme(axis.text=element_text(size=axis_text_font_size), axis.title=element_text(size=axis_title_font_size, face="bold"), legend.title = element_text(size=axis_title_font_size), legend.text = element_text(size = axis_title_font_size), strip.text = element_text(size = axis_title_font_size), axis.text.y=element_blank(), axis.ticks.y=element_blank()) +
+    theme(legend.position="bottom") + 
+    coord_flip() +
+    expand_limits(y = c(-1, 1)) +
+    ggpubr::font("title", size = 14, face = "bold")
+  
+  if (effects[DV] == "Total # items encoded") {
+    plot_abs <- plot
+  } else if (effects[DV] == "Within-person correlation") {
+    plot_cmle2 <- plot
+  } else if (effects[DV] == "Corrected memory") {
+    plot_abs2 <- plot
+  } else if (effects[DV] == "Curiosity-driven memory benefit") {
+    plot_cmle <- plot 
+  }
+  
+  
+  # cat("  \n")
+  # print(plot)
+  # cat("  \n")
+}
+
+# combine both into one plot
+ggpubr::ggarrange(plot_abs, plot_cmle, nrow = 2, ncol = 1,
+                  common.legend = T, legend = "bottom",
+                  labels = c("A", "B"))
+
+ggpubr::ggarrange(plot_abs2, plot_cmle2, nrow = 2, ncol = 1,
+                  common.legend = T, legend = "bottom",
+                  labels = c("A", "B"))
+
+
+```
+
+#### Figure S2
+```{r fig_s2, echo=FALSE, message=FALSE, warning=FALSE,  fig.align = "center", out.width = '100%', out.height= '100%', fig.height = 13, fig.width = 10, results="asis"}
+
+# subset data
+data_plot <- df_plot[df_plot$phase == paste0(phase_new[1]),]
+data_plot <- data_plot[data_plot$category == paste0(effects[1]) | data_plot$category == paste0(effects[2]),]
+data_plot$category <- factor(data_plot$category, levels = c(effects[1], effects[2]))
+                                                            
+# ggplot command
+plot <- ggplot(data_plot, aes(x=memory, y=cor, colour = smooth)) +
+  geom_hline(yintercept=0, linetype="dashed", size = 0.5, color="grey") +
+  geom_point(size = 2, aes(shape = smooth, colour = smooth),position=position_dodge(width=0.5)) +
+  geom_errorbar(aes(ymin=ci_l, ymax=ci_u), width=.1, size = 0.5, position=position_dodge(width=0.5)) +
+  facet_grid(category ~ factor(index, levels = c("Whole sample","Control group", "Incentives group","Difference C < I"))) +  
+  theme_classic() + 
+  scale_color_manual(values=wes_palette(n=4, name="IsleofDogs2")) + 
+  labs(x="", color = "3dBlurToFWHM", y = "Correlation measurement") +
+  guides(colour = guide_legend("3dBlurToFWHM"), shape = guide_legend("3dBlurToFWHM"), mapping = guide_legend("3dBlurToFWHM")) + 
+  theme(axis.text=element_text(size=axis_text_font_size), axis.title=element_text(size=axis_title_font_size, face="bold"), legend.title = element_text(size=axis_title_font_size), legend.text = element_text(size = axis_title_font_size), strip.text = element_text(size = axis_title_font_size), axis.text.y=element_blank(), axis.ticks.y=element_blank()) +
+  theme(legend.position="bottom") + 
+  coord_flip() +
+  expand_limits(y = c(-1, 1)) 
+
+print(plot)
+ggsave("Figure_S2.jpeg", units = "cm", width = 18, height = 16)
+
+
+```
+
+## Correlation between FC and memory measurements for each smoothing kernel
+
+Each table below shows the correlation between behavioural measures of learning and firstly, **the change in RSFC** in the context of consolidation and secondly, **task-FC** in the context of encoding. 
+
+* "cor" -> estimate from cor.test() whole sample using  
+* "pval" -> p value from cor.test()  
+* "cor_cont" -> estimate from cor.test() control group only  
+* "pval_cor_cont" -> p value from cor.test() control group only  
+* "cor_exp" -> estimate from cor.test() incentives group only  
+* "pval_cor_exp" -> p value from cor.test() incentives group only  
+* "corrDiff" -> difference in correlation between control and incentives group  
+* "pval_corrDiff" -> p value for difference in correlation between control and incentives group  
+
+note that all p < 0.05 were printed in **bold** whereas all 0.05 < p < 0.10 were printed in *italics*
+
+```{r tables, echo = FALSE, results = 'asis'}
+
+for (p in seq_along(phase)) { # for each phase
+  
+  ########## resting-state ##########
+  
+  # subset the reight rows
+  table <- df_brainbehav[df_brainbehav$phase == phase_new[p],]
+  table <- table[,!grepl("ci", names(table))]
+  table$phase <- NULL
+  table$category <- NULL
+  rownames(table) <- NULL
+  
+  #names(table) <- c("test", "correlation", "p value", "correlation", "p value", "correlation", "p value", "correlation", "p value")
+  
+  # print to markdown
+  print(kbl(table, escape = F, caption = paste("Correlation between FC and behaviour at", phase_new[p])) %>%
+          kable_styling(fixed_thead = T, bootstrap_options = c("striped", "hover", "condensed")) %>%
+          add_header_above(c(" " = 1, "Whole sample" = 2, "Control group" = 2, "Incentives group" = 2, "Difference C < I" = 2))  %>%
+          column_spec(1, bold = T, border_right = T) %>%
+          column_spec(2, bold = F, border_right = F) %>%
+          column_spec(3, bold = ifelse(table$pval < 0.05,  TRUE, FALSE), border_right = T) %>%
+          column_spec(3, italic = ifelse(table$pval < 0.1 & table$pval > 0.05,  T, F)) %>%
+          column_spec(5, bold = ifelse(table$pval_cor_cont < 0.05,  T, F), border_right = T) %>%
+          column_spec(5, italic = ifelse(table$pval_cor_cont < 0.1 & table$pval_cor_cont > 0.05,  T, F)) %>%
+          column_spec(7, bold = ifelse(table$pval_cor_exp < 0.05,  T, F), border_right = T) %>%
+          column_spec(7, italic = ifelse(table$pval_cor_exp < 0.1 & table$pval_cor_exp > 0.05,  T, F)) %>%
+          column_spec(9, bold = ifelse(table$pval_corrDiff < 0.05, T, F)) %>%
+          column_spec(9, italic = ifelse(table$pval_corrDiff < 0.1 & table$pval_corrDiff > 0.05,  T, F)) %>%
+          pack_rows(paste0(effects[1]), 1, 1*+length(smooth)) %>%
+          pack_rows(paste0(effects[2]), 1+1*+length(smooth), 2*+length(smooth)) 
+        %>%
+          pack_rows(paste0(effects[3]),  1+2*+length(smooth), 3*+length(smooth)) %>%
+          pack_rows(paste0(effects[4]),  1+3*+length(smooth), 4*+length(smooth)) #%>%
+        #pack_rows(paste0(effects[5]),  1+4*+length(smooth), 5*+length(smooth))
+  )
+  
+  cat('\n\n<!-- -->\n\n')
+  
+  # extract table to excel
+  if (p == 1) {
+    
+    # total # items 
+    start <- 1
+    end <- length(smooth)
+    temp1 <- rbind(rep(NA, ncol(table)), table[start:end, ]) # inserts empty row to top
+    temp1[1, "smooth"] <- effects[1]
+    
+    # cdmb
+    start <- 1 + length(smooth)
+    end <- length(smooth) + length(smooth)
+    temp2 <- rbind(rep(NA, ncol(table)), table[start:end, ]) # inserts empty row to top
+    temp2[1, "smooth"] <- effects[2]
+    
+    # combine
+    temp <- rbind(temp1, temp2)
+    temp <- rbind(rep(NA, ncol(temp)), temp) # inserts empty row to top
+    temp[1,] <- c("", "r", "p", "r", "p", "r", "p", "r", "p" )
+    names(temp) <- c("", "Whole sample", "", "Control group", "", "Incentives group", "", "Difference C < I", "")
+    
+    
+    xlsx::write.xlsx(temp, file=filename_tables, sheetName = "Table_S1", append = T, row.names = F, showNA = F) # note: row.names contain variables
+    
+  }
+  
+  rm(table)
+  
+}
+
+```
+
+## Predict behavioural measures of learning using FC values
+
+```{r lm, echo=FALSE, message=FALSE, warning=FALSE,  fig.align = "center", out.width = '100%', fig.width = 11, results="asis"}
+
+dfWide$group_e <- ifelse(dfWide$group == "exp", 1, -1)
+
+for (s in seq_along(smooth)) { # for each smoothing kernel
+  
+  for (DV in seq_along(DV_wide)) {
+    
+    # whole sample
+    lm <- lm(dfWide[, paste0(DV_wide[DV])] ~ scale(dfWide[, paste0("FC_online_", smooth[s])], center = T, scale = F) + scale(dfWide[, paste0("FC_offline_", smooth[s])], center = T, scale = F) + dfWide$group*scale(dfWide[, paste0("FC_diff_", smooth[s])], center = T, scale = F))
+    names(lm$coefficients) <- c('Intercept', 'Online FC','Offline FC', 'Incentives', 'RSFC change', 'Incentives * RSFC change')
+    # save models to run summary(lm()) command
+    if (DV_wide[DV] == "highConf_abs" && smooth[s] == "s4") {
+      lm_abs <- lm
+    }
+    
+    if (DV_wide[DV] == "CDMB" && smooth[s] == "s4") {
+      lm_cdmb <- lm
+    }
+    # control grouo
+    lm_cont <- lm(dfWide[dfWide$group == "cont", paste0(DV_wide[DV])] ~ scale(dfWide[dfWide$group == "cont", paste0("FC_online_", smooth[s])], center = T, scale = F) + scale(dfWide[dfWide$group == "cont", paste0("FC_offline_", smooth[s])], center = T, scale = F) + scale(dfWide[dfWide$group == "cont", paste0("FC_diff_", smooth[s])], center = T, scale = F))
+    names(lm_cont$coefficients) <- c('Intercept', 'Online FC','Offline FC', 'RSFC change')    
+    
+    # experimental group
+    lm_exp <- lm(dfWide[dfWide$group == "exp", paste0(DV_wide[DV])] ~ scale(dfWide[dfWide$group == "exp", paste0("FC_online_", smooth[s])], center = T, scale = F) + scale(dfWide[dfWide$group == "exp", paste0("FC_offline_", smooth[s])], center = T, scale = F) + scale(dfWide[dfWide$group == "exp", paste0("FC_diff_", smooth[s])], center = T, scale = F))
+    names(lm_exp$coefficients) <- c('Intercept', 'Online FC','Offline FC', 'RSFC change')      
+    
+    # sjPlot
+    cat("  \n####", paste0("Smoothing kernel ",gsub("s", "FWHM = ", smooth[s]), ": Linear model predicting ", paste0(effects[DV])))
+    cat("\n\n")
+    cat("\n")
+    cat(sjPlot::tab_model(lm, lm_cont, lm_exp, digits.p = 3, dv.labels = c("Whole sample", "Control group", "Incentives group"), show.stat = TRUE)$knitr,"\n--------\n")
+    cat("  \n")
+    cat(sjPlot::tab_model(lm, digits.p = 3, dv.labels = c("Whole sample"), show.stat = TRUE)$knitr,"\n--------\n")
+    cat("  \n")
+
+
+    # put them all into a table to export to excel
+    temp <- as.data.frame(summary(lm)$coef)
+    temp$param <- row.names(temp)
+    temp$beta_all <- paste0(round(temp$Estimate, 2), " (", round(temp$`Std. Error`, 2), ")")
+    temp$p_all <- round(temp$`Pr(>|t|)`, 3)
+    temp <- rbind(rep(NA, ncol(temp)), temp) # inserts empty row to top
+    temp[1, "param"] <- effects[DV]
+    temp$order <- 1:dim(temp)[1]
+    temp$p_all <- ifelse(temp$p_all == 0, "< 0.001", temp$p_all)
+    temp2 <- temp[, c("order", "param", "beta_all", "p_all")]
+    
+    temp <- as.data.frame(summary(lm_cont)$coef)
+    temp$param <- row.names(temp)
+    temp$beta_cont <- paste0(round(temp$Estimate, 2), " (", round(temp$`Std. Error`, 2), ")")
+    temp$p_cont <- round(temp$`Pr(>|t|)`, 3)
+    temp$p_cont <- ifelse(temp$p_cont == 0, "< 0.001", temp$p_cont)
+    temp2 <- merge(temp2, temp[, c("param", "beta_cont", "p_cont")], all.x = T)
+    
+    temp <- as.data.frame(summary(lm_exp)$coef)
+    temp$param <- row.names(temp)
+    temp$beta_exp <- paste0(round(temp$Estimate, 2), " (", round(temp$`Std. Error`, 2), ")")
+    temp$p_exp <- round(temp$`Pr(>|t|)`, 3)
+    temp$p_exp <- ifelse(temp$p_exp == 0, "< 0.001", temp$p_exp)
+    temp2 <- merge(temp2, temp[, c("param", "beta_exp", "p_exp")], all.x = T)
+    
+    # reorder rows
+    temp2 <- temp2[order(temp2$order),] 
+    temp2$order <- NULL
+    
+    if (DV == 1) {
+      df_lm <- temp2
+    } else {
+      df_lm <- rbind(df_lm, temp2)
+    }
+    
+  }
+  
+  if (s == 2) {
+    
+    df_lm <- rbind(rep(NA, ncol(df_lm)), df_lm) # inserts empty row to top
+    df_lm[1,] <- c("", "b (SE)", "p value", "b (SE)", "p value", "b (SE)", "p value" )
+    names(df_lm) <- c("", "Whole sample", "", "Control group", "", "Incentives group", "")
+    
+    # save file
+    xlsx::write.xlsx(df_lm, file=filename_tables, sheetName = "Table_S2", append = T, row.names = F, showNA = F) # note: row.names contain variables
+    
+  } else {
+    
+    df_lm <- rbind(rep(NA, ncol(df_lm)), rep(NA, ncol(df_lm)), df_lm) # inserts two empty rows to top
+    df_lm[1,] <- c("", "b (SE)", "p value", "b (SE)", "p value", "b (SE)", "p value" )
+    df_lm[2,1] <- paste0(gsub("s", "FWHM = ", smooth[s]))
+    names(df_lm) <- c("", "Whole sample", "", "Control group", "", "Incentives group", "")
+    
+    if (s == 1) {
+      df_lm_suppl <- df_lm
+    } else {
+      df_lm_suppl <- rbind(df_lm_suppl, df_lm)
+    }
+    
+  }
+  
+}
+
+# save file
+xlsx::write.xlsx(df_lm_suppl, file=filename_tables, sheetName = "Table_S2_extended", append = T, row.names = F, showNA = F) # note: row.names contain variables
+
+
+```
+
